@@ -1,23 +1,47 @@
-
 import streamlit as st
 import numpy as np
 import pandas as pd
 import time
+import torch
+import torch.nn as nn
 import joblib
-from tensorflow.keras.models import load_model
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 SEQ_LEN = 30
 ALERT_THRESHOLD = 20
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------
+# MODEL
+# -----------------------------
+class LSTMModel(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.lstm1 = nn.LSTM(input_size, 64, batch_first=True)
+        self.dropout1 = nn.Dropout(0.2)
+        self.lstm2 = nn.LSTM(64, 32, batch_first=True)
+        self.dropout2 = nn.Dropout(0.2)
+        self.fc = nn.Linear(32, 1)
+
+    def forward(self, x):
+        x, _ = self.lstm1(x)
+        x = self.dropout1(x)
+        x, _ = self.lstm2(x)
+        x = self.dropout2(x)
+        x = x[:, -1, :]
+        return self.fc(x)
 
 # -----------------------------
 # LOAD ARTIFACTS
 # -----------------------------
-model = load_model("model.h5", compile=False)
-scaler = joblib.load("scaler.pkl")
 feature_cols = joblib.load("features.pkl")
+scaler = joblib.load("scaler.pkl")
+
+model = LSTMModel(len(feature_cols)).to(DEVICE)
+model.load_state_dict(torch.load("model.pth", map_location=DEVICE))
+model.eval()
 
 # -----------------------------
 # LOAD DATA
@@ -30,12 +54,14 @@ data.columns = cols
 
 # Sidebar
 engine_id = st.sidebar.selectbox("Select Engine", data['unit'].unique())
-engine_data = data[data['unit'] == engine_id].reset_index(drop=True)
+engine_full = data[data['unit'] == engine_id].reset_index(drop=True)
 
-# Keep only trained features
-engine_data = engine_data[feature_cols]
+# TRUE RUL (for comparison)
+max_cycle = engine_full['cycle'].max()
+engine_full['TRUE_RUL'] = max_cycle - engine_full['cycle']
 
-# Apply scaling
+# Features + scaling
+engine_data = engine_full[feature_cols]
 engine_data = scaler.transform(engine_data)
 
 # -----------------------------
@@ -43,8 +69,16 @@ engine_data = scaler.transform(engine_data)
 # -----------------------------
 st.title("✈️ Engine Predictive Maintenance Dashboard")
 
-rul_display = st.empty()
+col1, col2, col3 = st.columns(3)
+
+rul_display = col1.empty()
+countdown_display = col2.empty()
+health_display = col3.empty()
+
 status_display = st.empty()
+delta_display = st.empty()
+progress_bar = st.progress(0)
+
 chart_placeholder = st.empty()
 
 start = st.button("Start Simulation")
@@ -54,52 +88,84 @@ start = st.button("Start Simulation")
 # -----------------------------
 if start:
     window = []
-    rul_history = []
+    pred_history = []
+    true_history = []
+
+    prev_rul = None
 
     for i in range(len(engine_data)):
         row = engine_data[i]
 
-        # simulate sensor noise
+        # simulate slight noise
         row = row + np.random.normal(0, 0.01, size=row.shape)
 
         window.append(row)
-
         if len(window) > SEQ_LEN:
             window.pop(0)
 
         if len(window) == SEQ_LEN:
             x = np.array(window).reshape(1, SEQ_LEN, len(feature_cols))
-            pred_rul = model.predict(x, verbose=0)[0][0]
+            x_tensor = torch.tensor(x, dtype=torch.float32).to(DEVICE)
 
-            # store REAL predictions
-            rul_history.append(pred_rul)
+            with torch.no_grad():
+                pred_rul = model(x_tensor).cpu().numpy()[0][0]
 
-            # trim history FIRST
-            if len(rul_history) > 200:
-                rul_history = rul_history[-200:]
+            true_rul = engine_full['TRUE_RUL'].iloc[i]
 
-            # smoothing AFTER trimming
-            smoothed_history = pd.Series(rul_history).rolling(window=5).mean()
+            pred_history.append(pred_rul)
+            true_history.append(true_rul)
 
-            # reset index for safety
-            smoothed_history = smoothed_history.reset_index(drop=True)
+            # sliding window
+            pred_history = pred_history[-200:]
+            true_history = true_history[-200:]
 
-            # update chart
+            # smoothing
+            smoothed = pd.Series(pred_history).rolling(5).mean()
+
+            # chart
+            cycles = list(range(len(pred_history)))
+
             chart_data = pd.DataFrame({
-                "Raw RUL": rul_history,
-                "Smoothed RUL": smoothed_history
-            })
+                "Cycle": cycles,
+                "Predicted RUL": pred_history,
+                "Smoothed": smoothed,
+                "True RUL": true_history
+            }).set_index("Cycle")
+
             chart_placeholder.line_chart(chart_data)
 
-            # display current value
+            # -----------------------------
+            # METRICS
+            # -----------------------------
             rul_display.metric("Predicted RUL", f"{pred_rul:.2f}")
+            countdown_display.metric("Cycles to Failure", f"{int(pred_rul)}")
 
-            # alerts
+            health = max(0, min(100, (pred_rul / 125) * 100))
+            health_display.metric("Health %", f"{health:.1f}%")
+
+            # SINGLE progress bar update
+            progress_bar.progress(int(health))
+
+            # -----------------------------
+            # TREND
+            # -----------------------------
+            if prev_rul is not None:
+                delta = pred_rul - prev_rul
+                if delta < 0:
+                    delta_display.error(f"📉 Degrading ({delta:.2f})")
+                else:
+                    delta_display.success(f"📈 Improving ({delta:.2f})")
+
+            prev_rul = pred_rul
+
+            # -----------------------------
+            # ALERTS
+            # -----------------------------
             if pred_rul < ALERT_THRESHOLD:
-                status_display.error(f"⚠️ CRITICAL: RUL < {ALERT_THRESHOLD}")
+                status_display.error("🚨 CRITICAL: Immediate maintenance required!")
             elif pred_rul < 50:
-                status_display.warning("⚠️ Warning: Degrading")
+                status_display.warning("⚠️ Warning: Engine degrading")
             else:
-                status_display.success("✅ Healthy")
+                status_display.success("✅ Engine operating normally")
 
-        time.sleep(0.1)
+        time.sleep(0.05)
