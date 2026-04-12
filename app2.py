@@ -57,12 +57,19 @@ conn = psycopg2.connect(
 cursor = conn.cursor()
 
 # -----------------------------
-# LOAD DATA
+# LOAD DATA (FD001 ONLY)
 # -----------------------------
-data = pd.read_sql("SELECT * FROM engine_data ORDER BY unit_id, cycle", conn)
+data = pd.read_sql(
+    """
+    SELECT * FROM engine_data 
+    WHERE fd_type = 'FD001'
+    ORDER BY unit_id, cycle
+    """,
+    conn
+)
 
 if data.empty:
-    st.error("🚨 No data found in database")
+    st.error("🚨 No FD001 data found in database")
     st.stop()
 
 data = data.drop(columns=["id", "created_at"])
@@ -77,14 +84,12 @@ max_cycle = engine_full['cycle'].max()
 engine_full['TRUE_RUL'] = max_cycle - engine_full['cycle']
 
 # Features
-engine_data = engine_full[feature_cols]
-engine_data = engine_data[feature_cols]
-engine_data = scaler.transform(engine_data)
+engine_data = scaler.transform(engine_full[feature_cols])
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("✈️ Engine Predictive Maintenance Dashboard")
+st.title("✈️ Engine Predictive Maintenance Dashboard (FD001)")
 
 col1, col2, col3 = st.columns(3)
 
@@ -112,8 +117,7 @@ if start:
     alert_triggered = False
 
     for i in range(len(engine_data)):
-        row = engine_data[i]
-        row = row + np.random.normal(0, 0.01, size=row.shape)
+        row = engine_data[i] + np.random.normal(0, 0.01, size=engine_data[i].shape)
 
         window.append(row)
         if len(window) > SEQ_LEN:
@@ -164,22 +168,26 @@ if start:
 
             prev_rul = pred_rul
 
-            # STORE prediction with real timestamp
+            # STORE PREDICTION (FD001 TAGGED)
             cursor.execute(
                 """
-                INSERT INTO predictions (unit_id, predicted_rul, actual_rul, created_at)
-                VALUES (%s, %s, %s, clock_timestamp())
+                INSERT INTO predictions 
+                (unit_id, fd_type, predicted_rul, actual_rul, created_at)
+                VALUES (%s, %s, %s, %s, clock_timestamp())
                 """,
-                (int(engine_id), float(pred_rul), float(true_rul))
+                (int(engine_id), "FD001", float(pred_rul), float(true_rul))
             )
 
-            # ALERT
+            # ALERT SYSTEM (FD001 ONLY)
             if pred_rul < ALERT_THRESHOLD:
                 status_display.error("🚨 CRITICAL: Immediate maintenance required!")
 
                 if not alert_triggered:
                     cursor.execute(
-                        "SELECT 1 FROM maintenance_alerts WHERE unit_id=%s AND alert_status='active'",
+                        """
+                        SELECT 1 FROM maintenance_alerts 
+                        WHERE unit_id=%s AND fd_type='FD001' AND alert_status='active'
+                        """,
                         (int(engine_id),)
                     )
 
@@ -187,10 +195,10 @@ if start:
                         cursor.execute(
                             """
                             INSERT INTO maintenance_alerts
-                            (unit_id, alert_triggered_at, predicted_rul_at_alert, threshold_used, severity_level)
-                            VALUES (%s, clock_timestamp(), %s, %s, %s)
+                            (unit_id, fd_type, alert_triggered_at, predicted_rul_at_alert, threshold_used, severity_level)
+                            VALUES (%s, %s, clock_timestamp(), %s, %s, %s)
                             """,
-                            (int(engine_id), float(pred_rul), ALERT_THRESHOLD, "HIGH")
+                            (int(engine_id), "FD001", float(pred_rul), ALERT_THRESHOLD, "HIGH")
                         )
 
                     alert_triggered = True
@@ -205,12 +213,12 @@ if start:
     conn.commit()
 
 # ==============================
-# DATABASE VIEW
+# DATABASE VIEW (FD001 ONLY)
 # ==============================
 st.divider()
 st.subheader("📂 Database Tables")
 
-# -------- Latest per engine --------
+# Latest
 st.markdown("### ⚡ Latest Prediction Per Engine")
 
 latest_df = pd.read_sql(
@@ -222,6 +230,7 @@ latest_df = pd.read_sql(
         ABS(predicted_rul - actual_rul) AS error,
         created_at
     FROM predictions
+    WHERE fd_type = 'FD001'
     ORDER BY unit_id, created_at DESC
     """,
     conn
@@ -229,10 +238,13 @@ latest_df = pd.read_sql(
 
 st.dataframe(latest_df, use_container_width=True)
 
-# -------- Paginated history --------
+# History
 st.markdown("### 📊 Prediction History")
 
-total_rows = pd.read_sql("SELECT COUNT(*) FROM predictions", conn).iloc[0,0]
+total_rows = pd.read_sql(
+    "SELECT COUNT(*) FROM predictions WHERE fd_type='FD001'",
+    conn
+).iloc[0,0]
 
 page_size = 20
 max_page = max(1, total_rows // page_size)
@@ -246,6 +258,7 @@ pred_df = pd.read_sql(
            ABS(predicted_rul - actual_rul) AS error,
            created_at
     FROM predictions
+    WHERE fd_type = 'FD001'
     ORDER BY created_at DESC
     LIMIT {page_size} OFFSET {offset}
     """,
@@ -254,14 +267,14 @@ pred_df = pd.read_sql(
 
 st.dataframe(pred_df, use_container_width=True)
 
-# -------- Alerts --------
+# Alerts
 st.markdown("### 🚨 Active Alerts")
 
 alerts_df = pd.read_sql(
     """
     SELECT unit_id, predicted_rul_at_alert, severity_level, alert_triggered_at
     FROM maintenance_alerts
-    WHERE alert_status = 'active'
+    WHERE fd_type = 'FD001' AND alert_status = 'active'
     ORDER BY alert_triggered_at DESC
     """,
     conn
